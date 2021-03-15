@@ -6,6 +6,7 @@ import pandas as pd
 import random
 
 # To lemmatise the words from dataset
+from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
 
 
@@ -26,16 +27,20 @@ def preprocess(inputfile):
     """
     columns = ['sentenceNr', 'word', 'POS', 'NEtag']
     rows = []
+
     lemmatise=WordNetLemmatizer().lemmatize
+    POS={'N':wordnet.NOUN, 'V':wordnet.VERB, 'J':wordnet.ADJ, 'R':wordnet.ADV}
+
     # inputfile already opened as an obj
     # each line: Int<tab>Float<tab>Word<tab>POS<tab>NEtag<newline>;  eg, '19\t1.0\ttroops\tNNS\tO\n'
     for line in inputfile.readlines()[1:]:
         line=line.strip('\n')
         items = line.split('\t')  # [indexNr, sentenceNr, Word,	POS, NEtag]
         items[1] = int( float(items[1]) )  # Turn sentenceNr "NNN.0" into integer
-        items[2] = lemmatise( items[2].lower() )  # Turn word to lowercase and citation form
-        # filter words? if items[2] not in AvoidList=>append to rows
-        rows.append(items[1:]) # All items but indexNr
+        items[2] = lemmatise(items[2].lower(), POS[ items[3][0] ]) if items[3][0] in POS else items[2]   # Lowercase and lemmatise according to POS, if applicable
+        
+        if items[4][0]!='O' or items[2] not in ['""""', ',', '.','-','(',')'] : #Some puncts provide important context eg '%' or '-'
+            rows.append(items[1:]) # All items but indexNr
 
     return pd.DataFrame(rows, columns=columns)
 
@@ -45,6 +50,10 @@ def preprocess(inputfile):
 #   the NE-type as .neclass property
 #   the neighbouring words (5 before, 5 after) as .features property
 # (6922 NE/instances from GMB dataset)
+
+# English stopwords and punctuations to avoid
+from nltk.corpus import stopwords
+import string
 
 class Instance:
     def __init__(self, name, neclass, features):
@@ -68,8 +77,12 @@ def create_instances(inputdata):
     tags_only = inputdata.groupby('sentenceNr')['NEtag'].apply(list)
     sents_words_tags = list(zip(words_only, tags_only))
     sentences = []  # 2999 sublists, each = [(w1,tag),(w2,tag)...]
+
+    #Sandwich sentences with start/end tokens so the context window size will always be 10
     for sen in sents_words_tags:
-        sentences.append( list(zip(sen[0],sen[1])) )
+        start = [ (t,'O') for t in ['<s1>','<s2>','<s3>','<s4>','<s5>']]
+        end = [(t,'O') for t in ['</s1>','</s2>','</s3>','</s4>','</s5>']]
+        sentences.append( start + list(zip(sen[0],sen[1])) + end )
 
     for sen in sentences:
         for duo in sen:
@@ -118,46 +131,74 @@ def create_instances(inputdata):
                 features = prev5 + next5 # The neighbouring 10 words
                 instances.append(Instance(NEname, NEclass, features))
                 
-    return instances  
+    return instances  #6922 objs
 
 # Code for part 3
 # generate vectors and split the instances into training and testing datasets at random
 from sklearn.feature_extraction.text import TfidfVectorizer
-def create_table(instances, top_freq=3000, stopwords="yes"):
+from sklearn.decomposition import TruncatedSVD
+import pandas as pd
+def create_table(instances):
 
     # .features and .neclass properties from each instance
-    docs=[obj.features for obj in instances] # Treat each features list as a doc
-    neclasses=[obj.neclass for obj in instances]
+    corpus=[obj.features for obj in instances] # list of features/doc 
+    neclasses=[obj.neclass for obj in instances]# list of class names
+    
+    #Initialize & config the vectorizer for already-tokenized docs
+    vectorizer = TfidfVectorizer(analyzer='word',tokenizer=lambda doc:doc,
+                preprocessor=lambda doc:doc, token_pattern=None) 
+    #Build corpus vocab & transform each doc to tfidf vector (which is in compressed sparse format)
+    vectors=vectorizer.fit_transform(corpus)
+    
+    #Turn sparce format into array format (df shape = no-of-NEs x vocab-size, eg 6922x4959)
+    vectors = pd.DataFrame.sparse.from_spmatrix(vectors)
+    
+    # Reduced the dims of tfidf vectors (eg to 3000-D)
+    tsvd = TruncatedSVD(3000)
+    reduced_vecs = tsvd.fit_transform(vectors)  # array of 3000-D vectors
 
-    if stopwords=="yes":
-        stopwords_opt=None
-    elif stopwords=="no":
-        stopwords_opt = 'english'
-    tfidf = TfidfVectorizer(preprocessor=' '.join, max_features=top_freq, stop_words=stopwords_opt)
-    tdidf_vecs= tfidf.fit_transform(docs) # Vectors are in compressed sparse format
-
-    # pd.DataFrame(tdidf_vecs[1], columns=["vector"])
-    df=pd.DataFrame.sparse.from_spmatrix( tdidf_vecs )
-    df.insert(0,'class',neclasses,) # Add to the leftest column
+    # Turn into DataFrame & add NE-class column to the left
+    reduced_matrix = {'NE_class':neclasses, 'vector':list(reduced_vecs)}
+    df = pd.DataFrame.from_dict(reduced_matrix)
+    
     return df
 
-def ttsplit(bigdf):
-    df_train = pd.DataFrame()
-    df_train['class'] = [random.choice(['art','eve','geo','gpe','nat','org','per','tim']) for i in range(80)]
-    for i in range(3000):
-        df_train[i] = npr.random(80)
 
-    df_test = pd.DataFrame()
-    df_test['class'] = [random.choice(['art','eve','geo','gpe','nat','org','per','tim']) for i in range(20)]
-    for i in range(3000):
-        df_test[i] = npr.random(20)
+def ttsplit(bigdf):
+
+    #Sample ~80% for training:
+    df_train = bigdf.sample(frac=0.80, replace=False)
+    # train X & train Y
+    train_vectors = df_train.vector # array of 5538 vector-arrays
+    train_vectors = np.asarray( [list(arr) for arr in train_vectors] ) # convert to array of 5538 vector-lists
+    train_neclasses = df_train.NE_class # array of 5538 NE classes
+    
+    # Excludes the sampled training-data, ie the remaining ~20%
+    df_test = bigdf.drop(df_train.index) 
+    # test X & test Y
+    test_vectors = df_test.vector.to_numpy() # array of 1384 vector arrays
+    test_vectors = np.asarray( [list(arr) for arr in test_vectors] ) # convert to array of 1384 vector-lists
+    test_neclasses = df_test.NE_class # array of 1384 NE classes
         
-    return df_train.drop('class', axis=1).to_numpy(), df_train['class'], df_test.drop('class', axis=1).to_numpy(), df_test['class']
+    return train_vectors, train_neclasses, test_vectors, test_neclasses
 
 # Code for part 5
 def confusion_matrix(truth, predictions):
-    print("I'm confusing.")
-    return "I'm confused."
+    
+    #Initialize a 8*8 table:
+    all_classes=list( set( list(truth)+list(predictions) ) )
+    all_classes.sort() # Order classes alphabetically
+    table={}
+    for i in all_classes:
+        table[i]={}
+        for j in all_classes:
+            table[i][j]=0
+    
+    #Fill in the counts
+    for gold, pred in list(zip(truth, predictions)):
+        table[gold][pred]+=1
+
+    return pd.DataFrame.from_dict(table)  # X-axis: truth/gold ; Y-axis:predicted
 
 # Code for bonus part B
 def bonusb(filename):
