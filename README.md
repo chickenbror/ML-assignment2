@@ -18,3 +18,10 @@ I used the tf-idf vectorizer to vectorize each 'features' list to account for ea
 **Part 5 confusion matrix analysis**
 
 The chance of successful classification appears to be relative to the proportional size of each NE class in the data. For example, 'geo', 'org', 'gpe' and 'per' were by a big margin correctly classified. Also, the training data performed better than the test data, where NE classes that account for small proportions in the data got few to none successful classification. One thig worth noting is that the dims size in Part 3 seems to matter. Originally I reduced them to 300-D, then 1000-D, and then 3000-D. The latter took longer time to process but it gave eg 'art', 'eve' more correct classifications, in particular in the training ddata confusion matrix.
+
+**Bonus B**
+
+Since we are only considering the surrounding O-tag words as part of each NE's features, we don't need to include I-tag words, so I ignored them during the preprocessing. This leaves there only B-tag words vs O-tag words to consider, so I changed latter to a boolean False whereas B-tag will value to True.
+
+When accounting for POS, I interleaved them with the words, ie, word1, POS1, word2, POS2... instead of concatenating word+POS because it would've significantly increased the size of unique vocab.
+I also made the dims reduction a parameter of the bonusb() function for easier comparison of different dimention sizes' outputs.

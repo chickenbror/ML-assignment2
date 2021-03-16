@@ -28,6 +28,7 @@ def preprocess(inputfile):
     columns = ['sentenceNr', 'word', 'POS', 'NEtag']
     rows = []
 
+    #Initialise  lemmatizer & config of part-of-speech of the word to be lemmatised
     lemmatise=WordNetLemmatizer().lemmatize
     POS={'N':wordnet.NOUN, 'V':wordnet.VERB, 'J':wordnet.ADJ, 'R':wordnet.ADV}
 
@@ -200,6 +201,153 @@ def confusion_matrix(truth, predictions):
 
     return pd.DataFrame.from_dict(table)  # X-axis: truth/gold ; Y-axis:predicted
 
+
+
+
 # Code for bonus part B
-def bonusb(filename):
-    pass
+
+from sklearn.svm import LinearSVC
+
+def bonusb(filename, training_frac=0.80, reduced_dims=1500):
+    
+    ##Step1: read file | process and filter | update sent-dict
+    with open(filename, "r") as file:
+    
+        lemmatise=WordNetLemmatizer().lemmatize
+        POS_ref={'N':wordnet.NOUN, 'V':wordnet.VERB, 'J':wordnet.ADJ, 'R':wordnet.ADV}
+        
+        sentences_dict = {}
+        for line in (file.readlines()[1:]):
+            line=line.strip('\n')
+            items = line.split('\t')  # [indexNr, sentenceNr, Word, POS, NEtag]
+            items[1] = int( float(items[1]) )  # Turn sentenceNr "NNN.0" into integer
+            
+            # Lowercase and lemmatise word according to POS, if applicable
+            items[2] =lemmatise(items[2].lower(), POS_ref[items[3][0]]) if items[3][0] in POS_ref else items[2]
+            items[4] = False if items[4]=='O' else items[4] #Change O-tag to boolean false
+            sentNr, word, pos, NEclass =items[1:]
+            
+            # Create sentence as a dict item and add start tokens
+            if sentNr not in sentences_dict:
+                sentences_dict[sentNr]=[ (t, t, False) for t in ['<s1>','<s2>','<s3>','<s4>','<s5>']]
+                
+            # Only add B-tag and O/False-tag words (ie ignoring I-tag words since they aren't part of context) 
+            # When adding O/False-tag words, skip puncts
+            if (NEclass and NEclass[0]=="B") or (NEclass==False and word.isalnum() ): 
+                sentences_dict[sentNr].append( (word, pos, NEclass) )
+        
+        #add end tokens to each sentence
+        for sen in sentences_dict.values():
+            sen.extend([(t, t, False) for t in ['</s1>','</s2>','</s3>','</s4>','</s5>']])
+
+
+    ##Step2: make a list of tuples (NEclass, [words&pos])
+    NEs_list=[]
+    for nr, sent in sentences_dict.items():
+        for trio in sent:
+            word,POS,NEclass=trio[:]
+            if NEclass:
+                i=sent.index(trio)
+                c=1
+                try:
+                        
+                    if sent[i+c][2]==False:
+                        next5=[]
+                        for nxt in range(5):
+                            try:
+                                nextword=sent[i+c+nxt][0:2] #tuple (word,pos)
+                                next5.extend(list(nextword)) #strs 'word','pos'
+                            except IndexError:
+                                pass
+                            
+                except IndexError:
+                    pass
+                
+                prev5=[]
+                for prev in range(5,0,-1):
+                    try:
+                        if i-prev>=0:
+                            prevword=sent[i-prev][0:2] #tuple (word,pos)
+                            prev5.extend(list(prevword)) #strs 'word','pos'
+                    except IndexError:
+                        pass
+                    
+                    
+                NEs_list.append((NEclass[2:],prev5+next5)) #each features_list = [w1,pos1, w2, pos2...w20, pos20]
+
+
+    ##Step3: vectorize | reduce dims
+    neclasses=[item[0] for item in NEs_list]# list of class names
+    corpus=[item[1] for item in NEs_list] # list of features/doc 
+
+    #Initialize & config the vectorizer for already-tokenized docs
+    vectorizer = TfidfVectorizer(analyzer='word',tokenizer=lambda doc:doc,
+                preprocessor=lambda doc:doc, token_pattern=None) 
+    #Build corpus vocab & transform each doc to tfidf vector (which is in compressed sparse format)
+    vectors=vectorizer.fit_transform(corpus)
+
+    #Turn sparce format into array format (df shape = no-of-NEs x vocab-size, eg 6922x4959)
+    vectors = pd.DataFrame.sparse.from_spmatrix(vectors)
+
+    # Reduced the dims of tfidf vectors (eg to 3000-D)
+    tsvd = TruncatedSVD( reduced_dims )
+    reduced_vecs = tsvd.fit_transform(vectors)  # array of n-D vectors
+
+    # Turn into DataFrame & add NE-class column to the left
+    reduced_matrix = {'NE_class':neclasses, 'vector':list(reduced_vecs)}
+    df = pd.DataFrame.from_dict(reduced_matrix)
+
+
+    ##Step4: split dataframe | separate & align NEclasses and vectors
+    #Sample ~80% for training:
+    df_train = df.sample(frac = training_frac, replace=False)
+    # train X & train Y
+    train_vectors = df_train.vector # array of 5538 vector-arrays
+    train_vectors = np.asarray( [list(arr) for arr in train_vectors] ) # convert to array of 5538 vector-lists
+    train_neclasses = df_train.NE_class # array of 5538 NE classes
+
+    # Excludes the sampled training-data, ie the remaining ~20%
+    df_test = df.drop(df_train.index) 
+    # test X & test Y
+    test_vectors = df_test.vector.to_numpy() # array of 1384 vector arrays
+    test_vectors = np.asarray( [list(arr) for arr in test_vectors] ) # convert to array of 1384 vector-lists
+    test_neclasses = df_test.NE_class # array of 1384 NE classes
+
+
+    ##Step5: train/fit models
+    train_X, train_y, test_X, test_y = train_vectors, train_neclasses, test_vectors, test_neclasses
+
+    model = LinearSVC()
+    model.fit(train_vectors, train_neclasses) #train with the 80% training data
+    
+    #use the trained model to predict/classify
+    train_predictions = model.predict(train_vectors)
+    test_predictions = model.predict(test_vectors)
+
+    def print_confusion_matrix(truth, predictions):
+    
+        #Initialize a table:
+        all_classes=list( set( list(truth)+list(predictions) ) )
+        all_classes.sort() # Order classes alphabetically
+        table={}
+        for i in all_classes:
+            table[i]={}
+            for j in all_classes:
+                table[i][j]=0
+        
+        #Fill in the counts
+        for gold, pred in list(zip(truth, predictions)):
+            table[gold][pred]+=1
+
+        print( pd.DataFrame.from_dict(table) )
+
+    #Print result:
+    print(f'Traing:Testing = {training_frac*100}%:{(1-training_frac)*100}% \nReduced dims: {reduced_dims}-D \n')
+
+    #Compare test data gold & test data predictions
+    print("\n Confusion matrix of TEST DATA:")
+    print_confusion_matrix(test_neclasses, test_predictions) 
+
+    #Compare training data gold & training data predictions
+    print("\n Confusion matrix of TRAINING DATA:")
+    print_confusion_matrix(train_neclasses, train_predictions) 
